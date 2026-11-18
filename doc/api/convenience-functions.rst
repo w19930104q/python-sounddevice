@@ -14,6 +14,7 @@ Convenience Functions using NumPy Arrays
       wait
       stop
       get_status
+      get_status_counts
       get_stream
 
 .. autofunction:: play
@@ -27,5 +28,7 @@ Convenience Functions using NumPy Arrays
 .. autofunction:: stop
 
 .. autofunction:: get_status
+
+.. autofunction:: get_status_counts
 
 .. autofunction:: get_stream

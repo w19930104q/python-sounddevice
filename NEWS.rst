@@ -1,5 +1,9 @@
 0.5.6 (2026-08-17):
  * Fix architecture detection on Windows ARM64
+ * Add ``loopback`` parameter to `playrec()` for hardened loopback
+   measurements (unified input/output channel mapping, aligned block
+   boundaries, strict over-/underflow checking via `CallbackStatusError`)
+ * Add `get_status_counts()` for per-category over-/underflow counts
 
 0.5.5 (2026-01-23):
  * Fix `bug from previous release`__

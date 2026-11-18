@@ -23,7 +23,8 @@
 API overview:
   * Convenience functions to play and record NumPy arrays:
     `play()`, `rec()`, `playrec()` and the related functions
-    `wait()`, `stop()`, `get_status()`, `get_stream()`
+    `wait()`, `stop()`, `get_status()`, `get_status_counts()`,
+    `get_stream()`
 
   * Functions to get information about the available hardware:
     `query_devices()`, `query_hostapis()`,
@@ -42,7 +43,7 @@ API overview:
 
   * Miscellaneous functions and classes:
     `sleep()`, `get_portaudio_version()`, `CallbackFlags`,
-    `CallbackStop`, `CallbackAbort`
+    `CallbackStop`, `CallbackAbort`, `CallbackStatusError`
 
 Online documentation:
     https://python-sounddevice.readthedocs.io/
@@ -289,7 +290,7 @@ def rec(frames=None, samplerate=None, channels=None, dtype=None,
 
 def playrec(data, samplerate=None, channels=None, dtype=None,
             out=None, input_mapping=None, output_mapping=None, blocking=False,
-            **kwargs):
+            loopback=False, **kwargs):
     """Simultaneous playback and recording of NumPy arrays.
 
     This function does the following steps internally:
@@ -332,6 +333,33 @@ def playrec(data, samplerate=None, channels=None, dtype=None,
         playback/recording is finished.
         A non-blocking invocation can be stopped with `stop()` or turned
         into a blocking one with `wait()`.
+    loopback : bool, optional
+        If ``True``, harden the playback/recording chain for loopback
+        measurements (where output channels are wired back to input
+        channels):
+
+        * The input and output channel mappings are unified: column
+          *j* of the returned array is guaranteed to be recorded from
+          the same physical channel that column *j* of *data* is
+          played to.  If only one of *input_mapping* and
+          *output_mapping* is given, it is used for both directions;
+          if both are given, they must be identical; if neither is
+          given, the channels ``1 ... data.shape[1]`` are used for
+          both directions.
+        * Playback and recording are consumed in identical block
+          boundaries: frame *n* of the recording is captured in the
+          very same callback block in which frame *n* of *data* is
+          played (any constant offset between the two is the
+          round-trip latency of the loopback connection).
+        * Each callback block reporting an input overflow, input
+          underflow, output underflow or output overflow is counted
+          per category (see `get_status_counts()`), and when the
+          stream finishes with a non-zero count in any of these
+          categories, `CallbackStatusError` is raised (from `wait()`,
+          or directly from ``playrec(..., blocking=True)``), because
+          the measurement cannot be trusted.
+
+        The default ``loopback=False`` keeps the previous behavior.
 
     Returns
     -------
@@ -361,6 +389,10 @@ def playrec(data, samplerate=None, channels=None, dtype=None,
 
     """
     ctx = _CallbackContext()
+    if loopback:
+        input_mapping, output_mapping = _check_loopback_mapping(
+            data, input_mapping, output_mapping)
+        ctx.strict_status = True
     output_frames = ctx.check_data(data, output_mapping, kwargs.get('device'))
     if dtype is None:
         dtype = ctx.data.dtype  # ignore module defaults
@@ -437,6 +469,34 @@ def get_status():
     """
     if _last_callback:
         return _last_callback.status
+    else:
+        raise RuntimeError('play()/rec()/playrec() was not called yet')
+
+
+def get_status_counts():
+    """Get per-category counts of over-/underflows since the last call.
+
+    In contrast to `get_status()`, which only reports whether a
+    certain condition happened *at least once*, this function returns
+    the number of callback blocks in which each condition was reported
+    during the last invocation of `play()`, `rec()` or `playrec()`.
+
+    Returns
+    -------
+    dict
+        A dictionary mapping each status category
+        (``'input_underflow'``, ``'input_overflow'``,
+        ``'output_underflow'``, ``'output_overflow'`` and
+        ``'priming_output'``) to the number of callback blocks in
+        which the corresponding flag was reported.
+
+    See Also
+    --------
+    get_status, CallbackFlags
+
+    """
+    if _last_callback:
+        return dict(_last_callback.status_counts)
     else:
         raise RuntimeError('play()/rec()/playrec() was not called yet')
 
@@ -2045,6 +2105,10 @@ class CallbackFlags:
         """
         return self._hasflag(_lib.paPrimingOutput)
 
+    @priming_output.setter
+    def priming_output(self, value):
+        self._updateflag(_lib.paPrimingOutput, value)
+
     def _hasflag(self, flag):
         """Check a given flag."""
         return bool(self._flags & flag)
@@ -2318,6 +2382,30 @@ class CallbackAbort(Exception):
     """
 
 
+class CallbackStatusError(Exception):
+    """Input/output over-/underflows occurred during a strict stream.
+
+    This is raised when a stream that was started with strict status
+    checking (currently only `playrec()` with ``loopback=True``)
+    finishes and at least one callback block reported an input
+    underflow, input overflow, output underflow or output overflow.
+
+    The attribute `counts` holds a dictionary mapping each status
+    category to the number of callback blocks in which it was
+    reported (see `get_status_counts()`).
+
+    """
+
+    def __init__(self, counts):
+        self.counts = dict(counts)
+        details = ', '.join(
+            '{} in {} callback block{}'.format(
+                name.replace('_', ' '), n, 's' if n != 1 else '')
+            for name, n in sorted(self.counts.items()) if n)
+        super().__init__(
+            'input/output over-/underflow occurred: ' + details)
+
+
 class AsioSettings:
 
     def __init__(self, channel_selectors):
@@ -2530,6 +2618,7 @@ class _CallbackContext:
     input_channels = output_channels = None
     input_dtype = output_dtype = None
     silent_channels = None
+    strict_status = False
 
     def __init__(self, loop=False):
         import threading
@@ -2542,6 +2631,10 @@ class _CallbackContext:
         self.loop = loop
         self.event = threading.Event()
         self.status = CallbackFlags()
+        self.status_counts = dict.fromkeys((
+            'input_underflow', 'input_overflow',
+            'output_underflow', 'output_overflow',
+            'priming_output'), 0)
 
     def check_data(self, data, mapping, device):
         """Check data and output mapping."""
@@ -2622,6 +2715,9 @@ class _CallbackContext:
     def callback_enter(self, status, data):
         """Check status and blocksize."""
         self.status |= status
+        for name in self.status_counts:
+            if getattr(status, name):
+                self.status_counts[name] += 1
         self.blocksize = min(self.frames - self.frame, len(data))
 
     def read_indata(self, indata):
@@ -2690,7 +2786,16 @@ class _CallbackContext:
             self.event.wait()
         finally:
             self.stream.close(ignore_errors)
+        if self.strict_status:
+            self.raise_for_status()
         return self.status if self.status else None
+
+    def raise_for_status(self):
+        """Raise CallbackStatusError if any over-/underflow was counted."""
+        counts = {name: count for name, count in self.status_counts.items()
+                  if count and name != 'priming_output'}
+        if counts:
+            raise CallbackStatusError(counts)
 
 
 def _ffi_string(cdata) -> bytes:
@@ -2717,6 +2822,25 @@ def _check_mapping(mapping, channels):
         channels = mapping.max()
         mapping -= 1  # channel numbers start with 1
     return mapping, channels
+
+
+def _check_loopback_mapping(data, input_mapping, output_mapping):
+    """Unify input/output mapping for playrec(..., loopback=True)."""
+    import numpy as np
+    if input_mapping is None and output_mapping is None:
+        data = np.asarray(data)
+        channels = 1 if data.ndim < 2 else data.shape[1]
+        mapping = list(range(1, channels + 1))
+        return mapping, list(mapping)
+    if input_mapping is None:
+        input_mapping = output_mapping
+    elif output_mapping is None:
+        output_mapping = input_mapping
+    elif not np.array_equal(np.atleast_1d(input_mapping),
+                            np.atleast_1d(output_mapping)):
+        raise ValueError(
+            'loopback=True requires identical input and output mappings')
+    return input_mapping, output_mapping
 
 
 def _check_dtype(dtype):

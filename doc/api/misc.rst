@@ -13,6 +13,7 @@ Miscellaneous
       CallbackFlags
       CallbackStop
       CallbackAbort
+      CallbackStatusError
       PortAudioError
 
 .. autofunction:: sleep
@@ -25,5 +26,7 @@ Miscellaneous
 .. autoexception:: CallbackStop
 
 .. autoexception:: CallbackAbort
+
+.. autoexception:: CallbackStatusError
 
 .. autoexception:: PortAudioError
