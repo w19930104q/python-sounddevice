@@ -1,3 +1,10 @@
+0.5.7 (unreleased):
+ * Validate dtype/shape/channels/mapping combinations before opening a
+   stream and raise classified errors (`StreamValidationError` and its
+   subclasses `DtypeError`, `ShapeError`, `ChannelsError`,
+   `MappingError`) instead of PortAudio error codes;
+   see `doc/api/validation-matrix.rst`
+
 0.5.6 (2026-08-17):
  * Fix architecture detection on Windows ARM64
 

@@ -52,6 +52,7 @@ __version__ = '0.5.6'
 
 import atexit as _atexit
 import contextlib as _contextlib
+import operator as _operator
 import os as _os
 import platform as _platform
 import sys as _sys
@@ -367,7 +368,7 @@ def playrec(data, samplerate=None, channels=None, dtype=None,
     out, input_frames = ctx.check_out(out, output_frames, channels, dtype,
                                       input_mapping)
     if input_frames != output_frames:
-        raise ValueError('len(data) != len(out)')
+        raise ShapeError('len(data) != len(out)')
     ctx.frames = input_frames
 
     def callback(indata, outdata, frames, time, status):
@@ -843,6 +844,17 @@ class _StreamBase:
                 iparameters = parameters
             elif kind == 'output':
                 oparameters = parameters
+
+        if wrap_callback == 'array':
+            # 'int24' cannot be represented as NumPy dtype, it is only
+            # supported by the "raw" stream classes:
+            dtypes = self._dtype if kind == 'duplex' else (self._dtype,)
+            for dt in dtypes:
+                if dt == 'int24':
+                    raise DtypeError(
+                        "'int24' is not supported by " +
+                        self.__class__.__name__ + ', use RawInputStream, '
+                        'RawOutputStream or RawStream instead')
 
         ffi_callback = _ffi.callback('PaStreamCallback', error=_lib.paAbort)
 
@@ -2292,6 +2304,48 @@ class PortAudioError(Exception):
         return errormsg
 
 
+class StreamValidationError(ValueError):
+    """Invalid combination of stream arguments, detected before opening a stream.
+
+    This is the base class for a family of exceptions that are raised
+    *before* a stream is opened (and therefore before any PortAudio
+    error code could be generated) when the combination of *dtype*,
+    array *shape*, number of *channels* and channel *mapping* is
+    invalid.  See `DtypeError`, `ShapeError`, `ChannelsError` and
+    `MappingError`.
+
+    All of these are subclasses of `ValueError`, so existing code
+    catching `ValueError` keeps working.
+
+    See Also
+    --------
+    PortAudioError
+
+    """
+
+
+class DtypeError(StreamValidationError, TypeError):
+    """Unsupported or inconsistent sample data type (*dtype*).
+
+    This is a subclass of both `StreamValidationError` (and thereby
+    `ValueError`) and `TypeError`, because historically both were
+    raised for invalid *dtype* arguments.
+
+    """
+
+
+class ShapeError(StreamValidationError):
+    """Unsupported shape of audio data or of a user-provided buffer."""
+
+
+class ChannelsError(StreamValidationError):
+    """Invalid number of channels."""
+
+
+class MappingError(StreamValidationError):
+    """Invalid channel mapping."""
+
+
 class CallbackStop(Exception):
     """Exception to be raised by the user to stop callback processing.
 
@@ -2550,7 +2604,7 @@ class _CallbackContext:
         if data.ndim < 2:
             data = data.reshape(-1, 1)
         elif data.ndim > 2:
-            raise ValueError(
+            raise ShapeError(
                 'audio data to be played back must be one- or two-dimensional')
         frames, channels = data.shape
         dtype = _check_dtype(data.dtype)
@@ -2559,7 +2613,7 @@ class _CallbackContext:
         if data.shape[1] == 1:
             pass  # No problem, mono data is duplicated into arbitrary channels
         elif data.shape[1] != len(mapping):
-            raise ValueError(
+            raise MappingError(
                 'number of output channels != size of output mapping')
         # Apparently, some PortAudio host APIs duplicate mono streams to the
         # first two channels, which is unexpected when specifying mapping=[1].
@@ -2570,7 +2624,7 @@ class _CallbackContext:
             channels = 2
         silent_channels = np.setdiff1d(np.arange(channels), mapping)
         if len(mapping) + len(silent_channels) != channels:
-            raise ValueError('each channel may only appear once in mapping')
+            raise MappingError('each channel may only appear once in mapping')
 
         self.data: np.typing.NDArray = data
         self.output_channels = channels
@@ -2603,14 +2657,22 @@ class _CallbackContext:
                     raise TypeError("'frames' must be an integer") from e
                 if not isinstance(channels, Integral):
                     raise TypeError("'channels' must be an integer") from e
-                raise e
+                raise DtypeError(
+                    f'Unsupported dtype: {dtype!r}') from e
+            except ValueError as e:
+                raise ShapeError(
+                    'Invalid shape for recording buffer: '
+                    f'(frames={frames!r}, channels={channels!r})') from e
         else:
+            if out.ndim != 2:
+                raise ShapeError(
+                    'out must be a two-dimensional array (frames, channels)')
             frames, channels = out.shape
             dtype = out.dtype
         dtype = _check_dtype(dtype)
         mapping, channels = _check_mapping(mapping, channels)
         if out.shape[1] != len(mapping):
-            raise ValueError(
+            raise MappingError(
                 'number of input channels != size of input mapping')
 
         self.out = out
@@ -2710,10 +2772,20 @@ def _check_mapping(mapping, channels):
     if mapping is None:
         mapping = np.arange(channels)
     else:
-        mapping = np.array(mapping, copy=True)
-        mapping = np.atleast_1d(mapping)
+        mapping = np.atleast_1d(np.array(mapping, copy=True))
+        if mapping.size == 0:
+            raise MappingError('mapping must not be empty')
+        try:
+            int_mapping = mapping.astype(np.intp)
+        except (TypeError, ValueError) as e:
+            raise MappingError(
+                'mapping must contain integers: ' + repr(mapping)) from e
+        if not np.array_equal(mapping, int_mapping):
+            raise MappingError(
+                'mapping must contain integers: ' + repr(mapping))
+        mapping = int_mapping
         if mapping.min() < 1:
-            raise ValueError('channel numbers must not be < 1')
+            raise MappingError('channel numbers must not be < 1')
         channels = mapping.max()
         mapping -= 1  # channel numbers start with 1
     return mapping, channels
@@ -2728,8 +2800,22 @@ def _check_dtype(dtype):
     elif dtype == 'float64':
         dtype = 'float32'
     else:
-        raise TypeError('Unsupported data type: ' + repr(dtype))
+        raise DtypeError('Unsupported data type: ' + repr(dtype))
     return dtype
+
+
+def _check_channels(channels, kind):
+    """Check that channels is an integer >= 1."""
+    assert kind in ('input', 'output')
+    try:
+        channels = _operator.index(channels)
+    except TypeError as e:
+        raise ChannelsError(
+            f'{kind} channels must be an integer, not {channels!r}') from e
+    if channels < 1:
+        raise ChannelsError(
+            f'{kind} channels must be at least 1, not {channels}')
+    return channels
 
 
 def _get_stream_parameters(kind, device, channels, dtype, latency,
@@ -2754,9 +2840,15 @@ def _get_stream_parameters(kind, device, channels, dtype, latency,
     if samplerate is None:
         samplerate = default.samplerate
 
+    if channels is not None:
+        channels = _check_channels(channels, kind)
     info = query_devices(device)
     if channels is None:
         channels = info['max_' + kind + '_channels']
+    elif channels > info['max_' + kind + '_channels']:
+        raise ChannelsError(
+            f'Invalid number of {kind} channels: {channels} '
+            f'(device supports at most {info["max_" + kind + "_channels"]})')
     try:
         # If NumPy is available, get canonical dtype name
         dtype = _sys.modules['numpy'].dtype(dtype).name
@@ -2764,8 +2856,8 @@ def _get_stream_parameters(kind, device, channels, dtype, latency,
         pass  # NumPy not available or invalid dtype (e.g. 'int24') or ...
     try:
         sampleformat = _sampleformats[dtype]
-    except KeyError as e:
-        raise ValueError('Invalid ' + kind + ' sample format') from e
+    except (KeyError, TypeError) as e:
+        raise DtypeError(f'Invalid {kind} dtype: {dtype!r}') from e
     samplesize = _check(_lib.Pa_GetSampleSize(sampleformat))
     if latency in ('low', 'high'):
         latency = info['default_' + latency + '_' + kind + '_latency']

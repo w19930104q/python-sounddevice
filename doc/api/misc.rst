@@ -14,6 +14,11 @@ Miscellaneous
       CallbackStop
       CallbackAbort
       PortAudioError
+      StreamValidationError
+      DtypeError
+      ShapeError
+      ChannelsError
+      MappingError
 
 .. autofunction:: sleep
 
@@ -27,3 +32,13 @@ Miscellaneous
 .. autoexception:: CallbackAbort
 
 .. autoexception:: PortAudioError
+
+.. autoexception:: StreamValidationError
+
+.. autoexception:: DtypeError
+
+.. autoexception:: ShapeError
+
+.. autoexception:: ChannelsError
+
+.. autoexception:: MappingError

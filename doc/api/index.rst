@@ -14,4 +14,5 @@ API Documentation
    streams
    raw-streams
    misc
+   validation-matrix
    expert-mode
