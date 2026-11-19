@@ -5,3 +5,8 @@ __pycache__/
 /dist/
 /src/_sounddevice.py
 /src/sounddevice.egg-info/
+
+# Long-run stability regression runtime artifacts
+/.pytest_cache/
+/.venv-regress/
+/.regress-lib/
