@@ -1,3 +1,8 @@
+unreleased:
+ * `play()` and `playrec()`: avoid copying the playback data when dtype,
+   memory layout and channel mapping already match PortAudio's requirements;
+   non-contiguous data is now converted explicitly (and only once)
+
 0.5.6 (2026-08-17):
  * Fix architecture detection on Windows ARM64
 

@@ -2530,6 +2530,7 @@ class _CallbackContext:
     input_channels = output_channels = None
     input_dtype = output_dtype = None
     silent_channels = None
+    _passthrough = False
 
     def __init__(self, loop=False):
         import threading
@@ -2552,6 +2553,11 @@ class _CallbackContext:
         elif data.ndim > 2:
             raise ValueError(
                 'audio data to be played back must be one- or two-dimensional')
+        # PortAudio needs interleaved (C-contiguous) samples.  Non-contiguous
+        # data is converted explicitly, once, here in the non-realtime path,
+        # instead of being gathered block-by-block in the audio callback.
+        # This is a no-op (and does not copy) if *data* is already contiguous.
+        data = np.ascontiguousarray(data)
         frames, channels = data.shape
         dtype = _check_dtype(data.dtype)
         mapping_is_explicit = mapping is not None
@@ -2577,6 +2583,17 @@ class _CallbackContext:
         self.output_dtype = dtype
         self.output_mapping = mapping
         self.silent_channels = silent_channels
+        # If dtype, memory layout and channel mapping all match what
+        # PortAudio expects, the audio callback can pass the (already
+        # contiguous) data straight through with a single memcpy per block,
+        # without creating any temporary arrays.  Note that 'float64' data
+        # does *not* take this path; it is cast to 'float32' block-by-block
+        # in the callback, avoiding a copy of the whole array.
+        self._passthrough = (
+            data.dtype.name == dtype
+            and data.shape[1] == channels
+            and len(silent_channels) == 0
+            and np.array_equal(mapping, np.arange(channels)))
         return frames
 
     def check_out(self, out, frames, channels, dtype, mapping):
@@ -2637,10 +2654,17 @@ class _CallbackContext:
 
     def write_outdata(self, outdata):
         silence = 128 if self.output_dtype == 'uint8' else 0
-        # 'float64' data is cast to 'float32' here:
-        outdata[:self.blocksize, self.output_mapping] = \
-            self.data[self.frame:self.frame + self.blocksize]
-        outdata[:self.blocksize, self.silent_channels] = silence
+        if self._passthrough:
+            # Zero-copy fast path: *outdata* and the relevant slice of
+            # *self.data* have the same dtype and are both C-contiguous,
+            # so this assignment is a single memcpy with no temporaries.
+            outdata[:self.blocksize] = \
+                self.data[self.frame:self.frame + self.blocksize]
+        else:
+            # 'float64' data is cast to 'float32' here:
+            outdata[:self.blocksize, self.output_mapping] = \
+                self.data[self.frame:self.frame + self.blocksize]
+            outdata[:self.blocksize, self.silent_channels] = silence
         if self.loop and self.blocksize < len(outdata):
             self.frame = 0
             outdata = outdata[self.blocksize:]
